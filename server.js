@@ -1,159 +1,135 @@
 const express = require('express');
-const cors = require('cors');
 const { Client, LocalAuth } = require('whatsapp-web.js');
-const QRCode = require('qrcode');
-const multer = require('multer');
-const csv = require('csv-parser');
-const fs = require('fs');
+const qrcode = require('qrcode');
 
 const app = express();
-const PORT = process.env.PORT || 3001;
-
-// Middlewares
-app.use(cors());
 app.use(express.json());
 
-// Configuração do multer para upload
-const upload = multer({ dest: 'uploads/' });
-
-// Cliente WhatsApp
-const client = new Client({
-    authStrategy: new LocalAuth(),
-    puppeteer: {
-        headless: true,
-        args: [
-            '--no-sandbox',
-            '--disable-setuid-sandbox',
-            '--disable-dev-shm-usage',
-            '--disable-accelerated-2d-canvas',
-            '--no-first-run',
-            '--no-zygote',
-            '--single-process',
-            '--disable-gpu'
-        ]
-    }
-});
-
-let qrCodeString = null;
+let client;
 let isReady = false;
-let connectionStatus = 'disconnected';
+let currentQR = null;
 
-// Eventos do WhatsApp
-client.on('qr', async (qr) => {
-    console.log('QR Code gerado');
-    qrCodeString = await QRCode.toDataURL(qr);
-    connectionStatus = 'qr_ready';
-});
+// Inicializar cliente WhatsApp
+function initializeClient() {
+    client = new Client({
+        authStrategy: new LocalAuth(),
+        puppeteer: {
+            headless: true,
+            args: [
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-dev-shm-usage',
+                '--disable-accelerated-2d-canvas',
+                '--no-first-run',
+                '--no-zygote',
+                '--single-process',
+                '--disable-gpu'
+            ]
+        }
+    });
 
-client.on('ready', () => {
-    console.log('WhatsApp conectado!');
-    isReady = true;
-    connectionStatus = 'connected';
-});
+    client.on('qr', async (qr) => {
+        console.log('QR Code recebido');
+        currentQR = await qrcode.toDataURL(qr);
+    });
 
-client.on('disconnected', () => {
-    console.log('WhatsApp desconectado');
-    isReady = false;
-    connectionStatus = 'disconnected';
-    qrCodeString = null;
-});
+    client.on('ready', () => {
+        console.log('WhatsApp conectado com sucesso!');
+        isReady = true;
+        currentQR = null; // Limpar QR quando conectado
+    });
 
-// Rotas da API
+    client.on('authenticated', () => {
+        console.log('WhatsApp autenticado!');
+        currentQR = null; // Limpar QR quando autenticado
+    });
+
+    client.on('disconnected', (reason) => {
+        console.log('WhatsApp desconectado:', reason);
+        isReady = false;
+        currentQR = null;
+    });
+
+    client.initialize();
+}
+
+// Rota principal
 app.get('/', (req, res) => {
-    res.json({ message: 'WhatsApp Sender API funcionando!' });
-});
-
-app.get('/api/status', (req, res) => {
-    res.json({
-        status: connectionStatus,
-        ready: isReady,
-        qrCode: qrCodeString
+    res.json({ 
+        message: 'API WhatsApp funcionando!',
+        status: 'online'
     });
 });
 
-app.post('/api/upload-csv', upload.single('csv'), (req, res) => {
-    if (!req.file) {
-        return res.status(400).json({ error: 'Nenhum arquivo enviado' });
-    }
-
-    const contacts = [];
-    
-    fs.createReadStream(req.file.path)
-        .pipe(csv())
-        .on('data', (row) => {
-            // Assumindo colunas: nome, numero
-            if (row.nome && row.numero) {
-                contacts.push({
-                    nome: row.nome.trim(),
-                    numero: row.numero.replace(/\D/g, '') // Remove caracteres não numéricos
-                });
-            }
-        })
-        .on('end', () => {
-            // Remove arquivo temporário
-            fs.unlinkSync(req.file.path);
-            res.json({ contacts, total: contacts.length });
-        })
-        .on('error', (error) => {
-            res.status(500).json({ error: 'Erro ao processar CSV' });
+// Rota de status - CORRIGIDA
+app.get('/api/status', (req, res) => {
+    if (isReady) {
+        // Se já está conectado, não mostrar QR
+        res.json({
+            status: 'connected',
+            ready: true,
+            qrCode: null,
+            message: 'WhatsApp conectado e pronto para enviar mensagens'
         });
+    } else if (currentQR) {
+        // Se tem QR disponível mas não está conectado
+        res.json({
+            status: 'qr_ready',
+            ready: false,
+            qrCode: currentQR,
+            message: 'Escaneie o QR Code para conectar'
+        });
+    } else {
+        // Se não tem QR e não está conectado (inicializando)
+        res.json({
+            status: 'initializing',
+            ready: false,
+            qrCode: null,
+            message: 'Inicializando WhatsApp Web...'
+        });
+    }
 });
 
-app.post('/api/send-bulk', async (req, res) => {
+// Rota para enviar mensagem
+app.post('/api/send-message', async (req, res) => {
     if (!isReady) {
-        return res.status(400).json({ error: 'WhatsApp não conectado' });
+        return res.status(400).json({
+            success: false,
+            message: 'WhatsApp não está conectado. Acesse /api/status para conectar.'
+        });
     }
 
-    const { contacts, messages, delay } = req.body;
-    
-    if (!contacts || !messages || !Array.isArray(contacts) || !Array.isArray(messages)) {
-        return res.status(400).json({ error: 'Dados inválidos' });
+    const { number, message } = req.body;
+
+    if (!number || !message) {
+        return res.status(400).json({
+            success: false,
+            message: 'Número e mensagem são obrigatórios'
+        });
     }
 
-    res.json({ message: 'Envio iniciado', total: contacts.length });
-
-    // Processar envios em background
-    processMessages(contacts, messages, delay || 5000);
-});
-
-async function processMessages(contacts, messages, delay) {
-    for (let i = 0; i < contacts.length; i++) {
-        const contact = contacts[i];
-        const randomMessage = messages[Math.floor(Math.random() * messages.length)];
+    try {
+        const chatId = number.includes('@c.us') ? number : `${number}@c.us`;
+        await client.sendMessage(chatId, message);
         
-        // Substituir variáveis na mensagem
-        const personalizedMessage = randomMessage
-            .replace(/{nome}/g, contact.nome)
-            .replace(/{numero}/g, contact.numero);
-
-        try {
-            const chatId = `55${contact.numero}@c.us`; // Formato brasileiro
-            await client.sendMessage(chatId, personalizedMessage);
-            console.log(`Mensagem enviada para ${contact.nome} (${contact.numero})`);
-        } catch (error) {
-            console.error(`Erro ao enviar para ${contact.nome}:`, error.message);
-        }
-
-        // Delay entre mensagens
-        if (i < contacts.length - 1) {
-            await new Promise(resolve => setTimeout(resolve, delay));
-        }
+        res.json({
+            success: true,
+            message: 'Mensagem enviada com sucesso!'
+        });
+    } catch (error) {
+        console.error('Erro ao enviar mensagem:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Erro ao enviar mensagem',
+            error: error.message
+        });
     }
-    
-    console.log('Envio em lote concluído');
-}
-
-app.post('/api/restart', (req, res) => {
-    client.destroy();
-    setTimeout(() => {
-        client.initialize();
-    }, 2000);
-    res.json({ message: 'Reiniciando conexão...' });
 });
 
-// Inicializar cliente
-client.initialize();
+// Inicializar cliente ao iniciar servidor
+initializeClient();
 
+const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log(`Servidor rodando na porta ${PORT}`);
 });
